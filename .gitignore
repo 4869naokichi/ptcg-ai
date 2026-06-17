@@ -32,6 +32,7 @@ kaggle.json
 .kaggle/
 *.tar.gz
 *.zip
+submission/ptcg_ai/
 
 # Large local reference files from the competition data bundle
 data/*.pdf
