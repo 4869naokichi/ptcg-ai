@@ -14,7 +14,12 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from cg.api import OptionType, SelectContext
 from ptcg_ai.training.features import FEATURE_NAMES, option_features, vectorize
-from ptcg_ai.training.linear_model import LinearActionModel, train_from_jsonl
+from ptcg_ai.training.linear_model import (
+    LinearActionModel,
+    _decision_weight,
+    _seat_baselines,
+    train_from_jsonl,
+)
 
 
 class TrainingTest(unittest.TestCase):
@@ -82,6 +87,62 @@ class TrainingTest(unittest.TestCase):
                 model.score({"card_crustle": 1.0}),
                 model.score({"card_kyogre": 1.0}),
             )
+
+    def test_seat_baselines_average_outcome_per_player(self) -> None:
+        decisions = [
+            {"playerIndex": 0, "selectedPlayerOutcome": -1.0},
+            {"playerIndex": 0, "selectedPlayerOutcome": -1.0},
+            {"playerIndex": 1, "selectedPlayerOutcome": 1.0},
+            {"playerIndex": 1, "selectedPlayerOutcome": 1.0},
+        ]
+        baselines = _seat_baselines(decisions)
+        self.assertEqual(baselines[0], -1.0)
+        self.assertEqual(baselines[1], 1.0)
+
+    def test_advantage_weight_removes_seat_bias(self) -> None:
+        # Seat 1 wins every game, so a win there carries zero advantage while a
+        # loss against the seat baseline is what actually signals a bad action.
+        baselines = {0: -1.0, 1: 1.0}
+        seat1_win = {"playerIndex": 1, "selectedPlayerOutcome": 1.0}
+        seat0_win = {"playerIndex": 0, "selectedPlayerOutcome": 1.0}
+
+        seat1_weight = _decision_weight(seat1_win, "advantage", baselines, temperature=1.0)
+        seat0_weight = _decision_weight(seat0_win, "advantage", baselines, temperature=1.0)
+
+        # The unexpected win (against a losing seat baseline) is weighted higher
+        # than the expected win on the dominant seat.
+        self.assertAlmostEqual(seat1_weight, 1.0, places=6)
+        self.assertGreater(seat0_weight, seat1_weight)
+
+    def test_train_from_jsonl_accepts_advantage_weighting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = Path(tmp_dir) / "self_play.jsonl"
+            output_path = Path(tmp_dir) / "model.npz"
+            decision = {
+                "recordType": "decision",
+                "playerIndex": 0,
+                "selectedPlayerOutcome": 1.0,
+                "options": [
+                    {"selected": True, "features": {"card_crustle": 1.0}},
+                    {"selected": False, "features": {"card_kyogre": 1.0}},
+                ],
+            }
+            input_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+
+            stats = train_from_jsonl(
+                input_path=input_path,
+                output_path=output_path,
+                epochs=50,
+                learning_rate=0.2,
+                l2=0.0,
+                outcome_weighting="advantage",
+                temperature=0.5,
+            )
+            model = LinearActionModel.load(output_path)
+
+            self.assertEqual(stats.pairs, 1)
+            self.assertEqual(model.metadata["outcomeWeighting"], "advantage")
+            self.assertEqual(model.metadata["temperature"], 0.5)
 
 
 if __name__ == "__main__":

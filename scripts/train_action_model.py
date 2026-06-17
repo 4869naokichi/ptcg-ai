@@ -27,7 +27,12 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--learning-rate", type=float, default=0.08)
     parser.add_argument("--l2", type=float, default=0.001)
-    parser.add_argument("--outcome-weighting", choices=["imitation", "winner"], default="imitation")
+    parser.add_argument(
+        "--outcome-weighting",
+        choices=["imitation", "winner", "advantage"],
+        default="imitation",
+    )
+    parser.add_argument("--temperature", type=float, default=1.0)
     args = parser.parse_args()
 
     stats = train_from_jsonl(
@@ -37,6 +42,7 @@ def main() -> None:
         learning_rate=args.learning_rate,
         l2=args.l2,
         outcome_weighting=args.outcome_weighting,
+        temperature=args.temperature,
     )
     print(f"wrote {stats.output_path}")
     print(f"decisions={stats.decisions}")

@@ -62,10 +62,15 @@ def train_from_jsonl(
     learning_rate: float = 0.05,
     l2: float = 0.001,
     outcome_weighting: str = "imitation",
+    temperature: float = 1.0,
 ) -> TrainingStats:
     records = read_jsonl(input_path)
     decisions = [record for record in records if record.get("recordType") == "decision"]
-    pair_diffs, pair_weights = _build_pairs(decisions, outcome_weighting=outcome_weighting)
+    pair_diffs, pair_weights = _build_pairs(
+        decisions,
+        outcome_weighting=outcome_weighting,
+        temperature=temperature,
+    )
     if not pair_diffs:
         raise ValueError(f"no training pairs found in {input_path}")
 
@@ -92,6 +97,7 @@ def train_from_jsonl(
             "learningRate": learning_rate,
             "l2": l2,
             "outcomeWeighting": outcome_weighting,
+            "temperature": temperature,
             "loss": loss,
             "accuracy": accuracy,
         },
@@ -110,13 +116,20 @@ def train_from_jsonl(
 def _build_pairs(
     decisions: list[dict[str, Any]],
     outcome_weighting: str,
+    temperature: float = 1.0,
 ) -> tuple[list[np.ndarray], list[float]]:
     pair_diffs: list[np.ndarray] = []
     pair_weights: list[float] = []
     feature_names = FEATURE_NAMES
+    baselines = _seat_baselines(decisions) if outcome_weighting == "advantage" else {}
 
     for decision in decisions:
-        outcome_weight = _decision_weight(decision, outcome_weighting)
+        outcome_weight = _decision_weight(
+            decision,
+            outcome_weighting,
+            baselines=baselines,
+            temperature=temperature,
+        )
 
         selected = []
         unselected = []
@@ -141,18 +154,45 @@ def _build_pairs(
     return pair_diffs, pair_weights
 
 
-def _decision_weight(decision: dict[str, Any], outcome_weighting: str) -> float:
+def _seat_baselines(decisions: list[dict[str, Any]]) -> dict[int, float]:
+    """Mean outcome per seat (playerIndex), used to remove first/second-player bias."""
+    sums: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    for decision in decisions:
+        player_index = int(decision.get("playerIndex", -1))
+        outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        sums[player_index] = sums.get(player_index, 0.0) + outcome
+        counts[player_index] = counts.get(player_index, 0) + 1
+    return {index: sums[index] / counts[index] for index in sums if counts[index] > 0}
+
+
+def _decision_weight(
+    decision: dict[str, Any],
+    outcome_weighting: str,
+    baselines: dict[int, float],
+    temperature: float,
+) -> float:
     if outcome_weighting == "imitation":
         return 1.0
-    if outcome_weighting != "winner":
-        raise ValueError(f"unknown outcome weighting: {outcome_weighting}")
 
-    selected_player_outcome = float(decision.get("selectedPlayerOutcome", 0.0))
-    if selected_player_outcome > 0:
-        return 1.0
-    if selected_player_outcome == 0:
-        return 0.6
-    return 0.35
+    if outcome_weighting == "winner":
+        selected_player_outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        if selected_player_outcome > 0:
+            return 1.0
+        if selected_player_outcome == 0:
+            return 0.6
+        return 0.35
+
+    if outcome_weighting == "advantage":
+        # Reward-weighted regression with a seat-conditioned baseline so the
+        # dominant first/second-player effect does not drown out action quality.
+        player_index = int(decision.get("playerIndex", -1))
+        outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        advantage = outcome - baselines.get(player_index, 0.0)
+        scale = temperature if temperature > 1e-6 else 1e-6
+        return float(np.exp(np.clip(advantage / scale, -3.0, 3.0)))
+
+    raise ValueError(f"unknown outcome weighting: {outcome_weighting}")
 
 
 def _loss_and_accuracy(
