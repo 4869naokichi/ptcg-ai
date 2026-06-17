@@ -14,15 +14,19 @@ from ptcg_ai.game.card_db import attack_by_id
 from ptcg_ai.game.constants import (
     BASIC_GRASS_ENERGY,
     BASIC_WATER_ENERGY,
+    BOSS_ORDERS,
+    BUDDY_BUDDY_POFFIN,
     CRUSTLE,
     DWEBBLE,
     KYOGRE,
     LILLIES_DETERMINATION,
     MEGA_ABOMASNOW_EX,
     SNOVER,
+    ULTRA_BALL,
 )
 from ptcg_ai.game.features import (
     active_pokemon,
+    attached_energy_count,
     bench_pokemon,
     count_card_id,
     deck_count,
@@ -30,6 +34,10 @@ from ptcg_ai.game.features import (
     remaining_hp_ratio,
     your_player,
 )
+
+# Superb Scissors (Crustle's only attack) costs 1 Grass + 2 colorless. Energy
+# beyond this on the Crustle line is wasted, so the policy stops attaching there.
+CRUSTLE_ATTACK_COST = 3
 
 
 def _enum_value(value: object) -> int | None:
@@ -216,6 +224,14 @@ class RuleBasedPolicy(Policy):
             score -= 800.0
         if card_id == MEGA_ABOMASNOW_EX and self._opponent_has_active(obs, CRUSTLE):
             score -= 450.0
+
+        # Keep a bench so a knocked-out active doesn't end the game, and develop
+        # it early with search items.
+        bench = self._your_bench_count(obs)
+        if card_id == DWEBBLE and bench < 3:
+            score += 240.0
+        if card_id in {BUDDY_BUDDY_POFFIN, ULTRA_BALL} and bench < 2:
+            score += 280.0
         return score
 
     def _score_attach(self, obs: object, option: object) -> float:
@@ -237,6 +253,15 @@ class RuleBasedPolicy(Policy):
         if source_id == BASIC_GRASS_ENERGY:
             score += 150.0
         if target_id in {DWEBBLE, CRUSTLE}:
+            target = self._pokemon_from_area(
+                obs,
+                getattr(option, "inPlayArea", None),
+                getattr(option, "inPlayIndex", None),
+                getattr(option, "playerIndex", None),
+            )
+            if attached_energy_count(target) >= CRUSTLE_ATTACK_COST:
+                # Already enough to attack; piling on more energy is wasted.
+                return -200.0
             score += 220.0
         if self._opponent_has_active(obs, CRUSTLE):
             if target_id == KYOGRE:
@@ -377,6 +402,41 @@ class RuleBasedPolicy(Policy):
             getattr(pokemon, "id", None) == card_id
             for pokemon in bench_pokemon(your_player(obs))
         )
+
+    def _your_bench_count(self, obs: object) -> int:
+        return len(bench_pokemon(your_player(obs)))
+
+    def _pokemon_from_area(
+        self,
+        obs: object,
+        area: object,
+        index: int | None,
+        player_index: int | None,
+    ) -> object | None:
+        if index is None:
+            return None
+        current = getattr(obs, "current", None)
+        if current is None:
+            return None
+        if player_index is None:
+            player_index = getattr(current, "yourIndex")
+        players = getattr(current, "players")
+        if player_index >= len(players):
+            return None
+        player = players[player_index]
+        if _is(area, AreaType.ACTIVE):
+            return self._object_at(getattr(player, "active", None), index)
+        if _is(area, AreaType.BENCH):
+            return self._object_at(getattr(player, "bench", None), index)
+        return None
+
+    def _object_at(self, cards: Iterable[object] | None, index: int) -> object | None:
+        if cards is None:
+            return None
+        cards_list = list(cards)
+        if index >= len(cards_list):
+            return None
+        return cards_list[index]
 
     def _option_card_id(self, obs: object, option: object) -> int | None:
         explicit_id = getattr(option, "cardId", None)
