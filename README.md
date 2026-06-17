@@ -33,6 +33,11 @@ data/               Competition data and sample submission files
 The build script copies `src/ptcg_ai/` to `submission/ptcg_ai/` and creates
 `submission.tar.gz`.
 
+The current default submission deck is a compact Crustle deck. It keeps a
+non-ex attacker as the main win condition so the agent is not hard-walled by
+Crustle-style damage prevention mirrors, while preserving the older Abomasnow
+deck under `ptcg_ai.decks.ABOMASNOW_DECK` for experiments.
+
 ## Local Visualizer
 
 ```bash
@@ -58,6 +63,20 @@ Downloaded images are stored under `data/card_images/` and are ignored by Git.
 By default the downloader uses direct `images.pokemontcg.io` URLs for known set
 codes. Use `--source api` or `--source auto` to try API-based matching for cards
 that do not have a direct set-code mapping.
+
+## Self-Play Training
+
+```bash
+.venv/bin/python scripts/collect_self_play.py --games 1000
+.venv/bin/python scripts/train_action_model.py
+.venv/bin/python scripts/evaluate.py --player0 learned --player1 random
+```
+
+Self-play logs are written to `outputs/training/self_play.jsonl`, and the
+trained action scorer is written to `outputs/models/action_model.npz`. Both are
+local artifacts and ignored by Git. The first trainer is an imitation-style
+pairwise linear scorer over legal actions; it is intentionally small so it can
+serve as the bridge from rule-based play to later reinforcement learning.
 
 ## Development Direction
 

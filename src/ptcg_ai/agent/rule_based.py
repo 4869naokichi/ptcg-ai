@@ -12,10 +12,23 @@ from ptcg_ai.agent.scoring import (
 )
 from ptcg_ai.game.card_db import attack_by_id
 from ptcg_ai.game.constants import (
+    BASIC_GRASS_ENERGY,
     BASIC_WATER_ENERGY,
+    CRUSTLE,
+    DWEBBLE,
     KYOGRE,
+    LILLIES_DETERMINATION,
     MEGA_ABOMASNOW_EX,
     SNOVER,
+)
+from ptcg_ai.game.features import (
+    active_pokemon,
+    bench_pokemon,
+    count_card_id,
+    deck_count,
+    opponent_player,
+    remaining_hp_ratio,
+    your_player,
 )
 
 
@@ -33,7 +46,7 @@ def _is(value: object, enum_member: object) -> bool:
 
 
 class RuleBasedPolicy(Policy):
-    """Small score-based policy for the current water deck."""
+    """Small score-based policy with deck and resource awareness."""
 
     def __init__(self, weights: ScoringWeights | None = None) -> None:
         self.weights = weights or ScoringWeights()
@@ -64,11 +77,11 @@ class RuleBasedPolicy(Policy):
         context = getattr(getattr(obs, "select"), "context", None)
 
         if _is(option_type, OptionType.YES):
-            return self._score_yes(context)
+            return self._score_yes(obs, context)
         if _is(option_type, OptionType.NO):
-            return self._score_no(context)
+            return self._score_no(obs, context)
         if _is(option_type, OptionType.NUMBER):
-            return float(getattr(option, "number", 0) or 0)
+            return self._score_number(obs, option, context)
         if _is(option_type, OptionType.PLAY):
             return self.weights.play_card + self._score_hand_card(obs, option)
         if _is(option_type, OptionType.ATTACH):
@@ -78,7 +91,7 @@ class RuleBasedPolicy(Policy):
         if _is(option_type, OptionType.ABILITY):
             return self.weights.ability + self._score_located_card(obs, option)
         if _is(option_type, OptionType.ATTACK):
-            return self.weights.attack + self._score_attack(option)
+            return self.weights.attack + self._score_attack(obs, option)
         if _is(option_type, OptionType.RETREAT):
             return self._score_retreat(obs)
         if _is(option_type, OptionType.END):
@@ -116,41 +129,94 @@ class RuleBasedPolicy(Policy):
 
         return max_count
 
-    def _score_yes(self, context: object) -> float:
+    def _score_yes(self, obs: object, context: object) -> float:
         if _is(context, SelectContext.IS_FIRST):
             return -20.0
         if _is(context, SelectContext.MULLIGAN):
             return 100.0
         if _is(context, SelectContext.ACTIVATE):
+            effect_id = self._effect_card_id(obs)
+            if effect_id == LILLIES_DETERMINATION and self._your_deck_count(obs) <= 10:
+                return -350.0
             return 95.0
         if _is(context, SelectContext.COIN_HEAD):
             return 50.0
         return 20.0
 
-    def _score_no(self, context: object) -> float:
+    def _score_no(self, obs: object, context: object) -> float:
         if _is(context, SelectContext.IS_FIRST):
             return 80.0
         if _is(context, SelectContext.MULLIGAN):
             return -50.0
         if _is(context, SelectContext.ACTIVATE):
+            effect_id = self._effect_card_id(obs)
+            if effect_id == LILLIES_DETERMINATION and self._your_deck_count(obs) <= 10:
+                return 160.0
             return -10.0
         return 0.0
 
-    def _score_attack(self, option: object) -> float:
+    def _score_number(self, obs: object, option: object, context: object) -> float:
+        number = int(getattr(option, "number", 0) or 0)
+        if _is(context, SelectContext.DRAW_COUNT):
+            safe_draw = max(0, self._your_deck_count(obs) - 2)
+            excess = max(0, number - safe_draw)
+            return (number * 20.0) - (excess * 500.0)
+        return float(number)
+
+    def _score_attack(self, obs: object, option: object) -> float:
         attack_id = getattr(option, "attackId", None)
+        opponent_active = self._opponent_active(obs)
+        opponent_active_id = getattr(opponent_active, "id", None)
+        opponent_hp = getattr(opponent_active, "hp", 0) or 0
+
+        if attack_id == 478:
+            return 420.0
+        if attack_id == 479:
+            score = 300.0
+            if opponent_active_id == CRUSTLE:
+                score += 180.0
+            if 0 < opponent_hp <= 120:
+                score += 120.0
+            return score
         if attack_id == 1046:
-            return 380.0
+            score = 380.0
+            if opponent_active_id == CRUSTLE:
+                score -= 1_200.0
+            deck_left = self._your_deck_count(obs)
+            if deck_left <= 6:
+                score -= 1_000.0
+            elif deck_left <= 10:
+                score -= 520.0
+            elif deck_left <= 14:
+                score -= 220.0
+            return score
         if attack_id == 1042:
-            return 260.0
+            water_in_discard = self._your_discard_count(obs, BASIC_WATER_ENERGY)
+            score = 160.0 + (water_in_discard * 35.0)
+            if self._your_deck_count(obs) <= 12 and water_in_discard > 0:
+                score += 260.0 + (water_in_discard * 20.0)
+            if 0 < opponent_hp <= water_in_discard * 20:
+                score += 180.0
+            return score
 
         attack = attack_by_id(attack_id)
         if attack is None:
             return 0.0
-        return float(getattr(attack, "damage", 0) or 0)
+        score = float(getattr(attack, "damage", 0) or 0)
+        if attack_id == 1047 and opponent_active_id == CRUSTLE:
+            score -= 1_000.0
+        if 0 < opponent_hp <= score:
+            score += 120.0
+        return score
 
     def _score_hand_card(self, obs: object, option: object) -> float:
         card_id = self._hand_card_id(obs, getattr(option, "index", None))
-        return card_priority(card_id, self.weights)
+        score = card_priority(card_id, self.weights)
+        if card_id == LILLIES_DETERMINATION and self._your_deck_count(obs) <= 10:
+            score -= 800.0
+        if card_id == MEGA_ABOMASNOW_EX and self._opponent_has_active(obs, CRUSTLE):
+            score -= 450.0
+        return score
 
     def _score_attach(self, obs: object, option: object) -> float:
         source_id = self._card_id_from_area(
@@ -168,6 +234,15 @@ class RuleBasedPolicy(Policy):
         score = card_priority(target_id, self.weights)
         if source_id == BASIC_WATER_ENERGY:
             score += 160.0
+        if source_id == BASIC_GRASS_ENERGY:
+            score += 150.0
+        if target_id in {DWEBBLE, CRUSTLE}:
+            score += 220.0
+        if self._opponent_has_active(obs, CRUSTLE):
+            if target_id == KYOGRE:
+                score += 320.0
+            if target_id in {SNOVER, MEGA_ABOMASNOW_EX}:
+                score -= 260.0
         return score
 
     def _score_evolve(self, obs: object, option: object) -> float:
@@ -183,16 +258,23 @@ class RuleBasedPolicy(Policy):
             getattr(option, "inPlayIndex", None),
             getattr(option, "playerIndex", None),
         )
-        return card_priority(evolved_id, self.weights) + card_priority(target_id, self.weights)
+        score = card_priority(evolved_id, self.weights) + card_priority(target_id, self.weights)
+        if evolved_id == CRUSTLE and target_id == DWEBBLE:
+            score += 500.0
+        if evolved_id == MEGA_ABOMASNOW_EX and self._opponent_has_active(obs, CRUSTLE):
+            score -= 420.0
+        return score
 
     def _score_retreat(self, obs: object) -> float:
         active = self._your_active(obs)
         if active is None:
             return 0.0
 
-        hp = getattr(active, "hp", 0) or 0
-        max_hp = getattr(active, "maxHp", 1) or 1
-        if hp * 2 <= max_hp:
+        if getattr(active, "id", None) == MEGA_ABOMASNOW_EX and self._opponent_has_active(obs, CRUSTLE):
+            if self._your_bench_has(obs, KYOGRE) or self._your_bench_has(obs, CRUSTLE):
+                return self.weights.retreat + 520.0
+
+        if remaining_hp_ratio(active) <= 0.5:
             return self.weights.retreat + 120.0
         return self.weights.retreat
 
@@ -209,6 +291,8 @@ class RuleBasedPolicy(Policy):
         card_id = self._option_card_id(obs, option)
 
         if _is(context, SelectContext.SETUP_ACTIVE_POKEMON):
+            if card_id == DWEBBLE:
+                return 1120.0
             if card_id == KYOGRE:
                 return 1000.0
             if card_id == SNOVER:
@@ -216,6 +300,8 @@ class RuleBasedPolicy(Policy):
             return card_priority(card_id, self.weights)
 
         if _is(context, SelectContext.SETUP_BENCH_POKEMON):
+            if card_id == DWEBBLE:
+                return 980.0
             if card_id == SNOVER:
                 return 900.0
             if card_id == KYOGRE:
@@ -223,11 +309,17 @@ class RuleBasedPolicy(Policy):
             return card_priority(card_id, self.weights)
 
         if _is(context, SelectContext.EVOLVES_TO):
+            if card_id == CRUSTLE:
+                return 1120.0
             if card_id == MEGA_ABOMASNOW_EX:
+                if self._opponent_has_active(obs, CRUSTLE):
+                    return 120.0
                 return 1000.0
             return card_priority(card_id, self.weights)
 
         if _is(context, SelectContext.EVOLVES_FROM):
+            if card_id == DWEBBLE:
+                return 1100.0
             if card_id == SNOVER:
                 return 920.0
             return card_priority(card_id, self.weights)
@@ -247,7 +339,44 @@ class RuleBasedPolicy(Policy):
         if _is(context, SelectContext.DISCARD):
             return discard_priority(card_id, self.weights)
 
+        if _is(context, SelectContext.TO_DECK) or _is(context, SelectContext.TO_DECK_BOTTOM):
+            if _is(getattr(option, "area", None), AreaType.DISCARD):
+                return 200.0 + card_priority(card_id, self.weights)
+            return discard_priority(card_id, self.weights)
+
+        if _is(context, SelectContext.NOT_MOVE):
+            return card_priority(card_id, self.weights)
+
         return card_priority(card_id, self.weights)
+
+    def _effect_card_id(self, obs: object) -> int | None:
+        select = getattr(obs, "select", None)
+        if select is None:
+            return None
+        effect = getattr(select, "effect", None)
+        return getattr(effect, "id", None)
+
+    def _your_deck_count(self, obs: object) -> int:
+        return deck_count(your_player(obs))
+
+    def _your_discard_count(self, obs: object, card_id: int) -> int:
+        player = your_player(obs)
+        if player is None:
+            return 0
+        return count_card_id(getattr(player, "discard", None), card_id)
+
+    def _opponent_active(self, obs: object) -> object | None:
+        return active_pokemon(opponent_player(obs))
+
+    def _opponent_has_active(self, obs: object, card_id: int) -> bool:
+        active = self._opponent_active(obs)
+        return getattr(active, "id", None) == card_id
+
+    def _your_bench_has(self, obs: object, card_id: int) -> bool:
+        return any(
+            getattr(pokemon, "id", None) == card_id
+            for pokemon in bench_pokemon(your_player(obs))
+        )
 
     def _option_card_id(self, obs: object, option: object) -> int | None:
         explicit_id = getattr(option, "cardId", None)

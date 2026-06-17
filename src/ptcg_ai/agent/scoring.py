@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ptcg_ai.game.constants import (
+    BASIC_GRASS_ENERGY,
     BASIC_WATER_ENERGY,
+    CRUSTLE,
     CYRANO,
+    DWEBBLE,
     KYOGRE,
     LILLIES_DETERMINATION,
     MAXIMUM_BELT,
@@ -21,15 +24,18 @@ class ScoringWeights:
 
     key_cards: dict[int, float] = field(
         default_factory=lambda: {
+            CRUSTLE: 560.0,
             MEGA_ABOMASNOW_EX: 520.0,
             KYOGRE: 430.0,
+            DWEBBLE: 420.0,
             SNOVER: 390.0,
             MEGA_SIGNAL: 330.0,
             WAITRESS: 310.0,
             LILLIES_DETERMINATION: 280.0,
             CYRANO: 230.0,
-            MAXIMUM_BELT: 210.0,
+            MAXIMUM_BELT: 260.0,
             BASIC_WATER_ENERGY: 160.0,
+            BASIC_GRASS_ENERGY: 150.0,
         }
     )
     play_card: float = 220.0
@@ -52,6 +58,6 @@ def discard_priority(card_id: int | None, weights: ScoringWeights) -> float:
 
     if card_id is None:
         return 0.0
-    if card_id == BASIC_WATER_ENERGY:
+    if card_id in {BASIC_GRASS_ENERGY, BASIC_WATER_ENERGY}:
         return 180.0
     return 120.0 - card_priority(card_id, weights)

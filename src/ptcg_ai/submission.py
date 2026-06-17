@@ -5,7 +5,7 @@ from pathlib import Path
 from cg.api import Observation, to_observation_class
 
 from ptcg_ai.agent.rule_based import RuleBasedPolicy
-from ptcg_ai.decks import ABOMASNOW_DECK
+from ptcg_ai.decks import DEFAULT_DECK
 
 _POLICY = RuleBasedPolicy()
 
@@ -29,7 +29,7 @@ def read_deck_csv() -> list[int]:
                 if line.strip()
             ][:60]
 
-    return list(ABOMASNOW_DECK)
+    return list(DEFAULT_DECK)
 
 
 def agent(obs_dict: dict) -> list[int]:

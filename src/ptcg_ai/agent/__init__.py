@@ -2,7 +2,7 @@
 
 from .policy import Policy
 
-__all__ = ["Policy", "RandomPolicy", "RuleBasedPolicy"]
+__all__ = ["LearnedPolicy", "Policy", "RandomPolicy", "RuleBasedPolicy"]
 
 
 def __getattr__(name: str):
@@ -14,4 +14,8 @@ def __getattr__(name: str):
         from .rule_based import RuleBasedPolicy
 
         return RuleBasedPolicy
+    if name == "LearnedPolicy":
+        from .learned_policy import LearnedPolicy
+
+        return LearnedPolicy
     raise AttributeError(name)
