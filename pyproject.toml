@@ -1,0 +1,9 @@
+[project]
+name = "ptcg-ai"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = [
+    "kaggle>=2.2.2",
+    "numpy>=2.4.6",
+    "pandas>=3.0.3",
+]
