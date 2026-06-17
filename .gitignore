@@ -33,6 +33,9 @@ kaggle.json
 *.tar.gz
 *.zip
 
+# Large local reference files from the competition data bundle
+data/*.pdf
+
 # Local experiment artifacts
 logs/
 runs/
