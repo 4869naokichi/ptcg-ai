@@ -21,6 +21,7 @@ data/               Competition data and sample submission files
 ```bash
 .venv/bin/python -m unittest discover -s tests
 .venv/bin/python scripts/evaluate.py --games 2
+.venv/bin/python scripts/visualize.py --max-steps 200
 ```
 
 ## Build A Submission
@@ -31,6 +32,32 @@ data/               Competition data and sample submission files
 
 The build script copies `src/ptcg_ai/` to `submission/ptcg_ai/` and creates
 `submission.tar.gz`.
+
+## Local Visualizer
+
+```bash
+.venv/bin/python scripts/visualize.py --player0 rule --player1 random --output outputs/visualizer/game.html
+```
+
+The visualizer writes an HTML replay. Open the generated file in a browser to
+inspect board state, selections, and logs step by step. Use the play/pause
+button for automatic playback. Without optional card images, the HTML is
+self-contained.
+
+Card images are optional and local-only. If `data/card_images/721.jpg` or
+`data/card_images/721.png` exists, the replay will use it for card ID `721`.
+
+To fetch images for the current deck:
+
+```bash
+.venv/bin/python scripts/download_card_images.py --deck-only
+.venv/bin/python scripts/visualize.py
+```
+
+Downloaded images are stored under `data/card_images/` and are ignored by Git.
+By default the downloader uses direct `images.pokemontcg.io` URLs for known set
+codes. Use `--source api` or `--source auto` to try API-based matching for cards
+that do not have a direct set-code mapping.
 
 ## Development Direction
 

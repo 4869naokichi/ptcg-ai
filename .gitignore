@@ -36,6 +36,7 @@ submission/ptcg_ai/
 
 # Large local reference files from the competition data bundle
 data/*.pdf
+data/card_images/
 
 # Local experiment artifacts
 logs/
