@@ -10,7 +10,9 @@ from ptcg_ai.agent.scoring import (
     card_priority,
     discard_priority,
 )
-from ptcg_ai.game.card_db import attack_by_id
+from functools import lru_cache
+
+from ptcg_ai.game.card_db import all_card_data, attack_by_id, card_by_id
 from ptcg_ai.game.constants import (
     BASIC_GRASS_ENERGY,
     BASIC_WATER_ENERGY,
@@ -35,9 +37,43 @@ from ptcg_ai.game.features import (
     your_player,
 )
 
-# Superb Scissors (Crustle's only attack) costs 1 Grass + 2 colorless. Energy
-# beyond this on the Crustle line is wasted, so the policy stops attaching there.
-CRUSTLE_ATTACK_COST = 3
+
+@lru_cache(maxsize=None)
+def _evolution_attack_cost(card_name: str) -> int:
+    """Highest attack energy cost among Pokémon that evolve from this card."""
+    best = 0
+    for card in all_card_data():
+        if getattr(card, "evolvesFrom", None) != card_name:
+            continue
+        for attack_id in getattr(card, "attacks", []) or []:
+            attack = attack_by_id(attack_id)
+            if attack is not None:
+                best = max(best, len(getattr(attack, "energies", []) or []))
+    return best
+
+
+@lru_cache(maxsize=None)
+def attack_energy_cost(card_id: int | None) -> int:
+    """Energy a Pokémon needs to attack, read from card data.
+
+    Uses the most expensive attack of the card and of anything it evolves into,
+    so energy is banked on a pre-evolution (e.g. Dwebble) up to what the evolved
+    attacker (Crustle's Superb Scissors = 3) will need.
+    """
+    if card_id is None:
+        return 0
+    card = card_by_id(card_id)
+    if card is None:
+        return 0
+    best = 0
+    for attack_id in getattr(card, "attacks", []) or []:
+        attack = attack_by_id(attack_id)
+        if attack is not None:
+            best = max(best, len(getattr(attack, "energies", []) or []))
+    name = getattr(card, "name", None)
+    if name:
+        best = max(best, _evolution_attack_cost(name))
+    return best
 
 
 def _enum_value(value: object) -> int | None:
@@ -252,17 +288,21 @@ class RuleBasedPolicy(Policy):
             score += 160.0
         if source_id == BASIC_GRASS_ENERGY:
             score += 150.0
+        target = self._pokemon_from_area(
+            obs,
+            getattr(option, "inPlayArea", None),
+            getattr(option, "inPlayIndex", None),
+            getattr(option, "playerIndex", None),
+        )
+        needed = attack_energy_cost(target_id)
+        if needed > 0 and attached_energy_count(target) >= needed:
+            # Already has enough energy to attack; more is wasted.
+            return -200.0
         if target_id in {DWEBBLE, CRUSTLE}:
-            target = self._pokemon_from_area(
-                obs,
-                getattr(option, "inPlayArea", None),
-                getattr(option, "inPlayIndex", None),
-                getattr(option, "playerIndex", None),
-            )
-            if attached_energy_count(target) >= CRUSTLE_ATTACK_COST:
-                # Already enough to attack; piling on more energy is wasted.
-                return -200.0
+            # Prioritise powering the Crustle line, and the active attacker first.
             score += 220.0
+            if _is(getattr(option, "inPlayArea", None), AreaType.ACTIVE):
+                score += 60.0
         if self._opponent_has_active(obs, CRUSTLE):
             if target_id == KYOGRE:
                 score += 320.0
