@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+PRIZE_TOTAL = 6.0
 
 from ptcg_ai.training.features import FEATURE_NAMES
 from ptcg_ai.training.logs import read_jsonl
@@ -62,10 +65,18 @@ def train_from_jsonl(
     learning_rate: float = 0.05,
     l2: float = 0.001,
     outcome_weighting: str = "imitation",
+    temperature: float = 1.0,
+    gamma: float = 0.99,
 ) -> TrainingStats:
     records = read_jsonl(input_path)
     decisions = [record for record in records if record.get("recordType") == "decision"]
-    pair_diffs, pair_weights = _build_pairs(decisions, outcome_weighting=outcome_weighting)
+    decision_weights = _compute_decision_weights(
+        decisions,
+        outcome_weighting=outcome_weighting,
+        temperature=temperature,
+        gamma=gamma,
+    )
+    pair_diffs, pair_weights = _build_pairs(decisions, decision_weights)
     if not pair_diffs:
         raise ValueError(f"no training pairs found in {input_path}")
 
@@ -92,6 +103,8 @@ def train_from_jsonl(
             "learningRate": learning_rate,
             "l2": l2,
             "outcomeWeighting": outcome_weighting,
+            "temperature": temperature,
+            "gamma": gamma,
             "loss": loss,
             "accuracy": accuracy,
         },
@@ -109,15 +122,13 @@ def train_from_jsonl(
 
 def _build_pairs(
     decisions: list[dict[str, Any]],
-    outcome_weighting: str,
+    decision_weights: list[float],
 ) -> tuple[list[np.ndarray], list[float]]:
     pair_diffs: list[np.ndarray] = []
     pair_weights: list[float] = []
     feature_names = FEATURE_NAMES
 
-    for decision in decisions:
-        outcome_weight = _decision_weight(decision, outcome_weighting)
-
+    for decision, outcome_weight in zip(decisions, decision_weights):
         selected = []
         unselected = []
         for option in decision.get("options", []):
@@ -141,18 +152,128 @@ def _build_pairs(
     return pair_diffs, pair_weights
 
 
-def _decision_weight(decision: dict[str, Any], outcome_weighting: str) -> float:
+def _compute_decision_weights(
+    decisions: list[dict[str, Any]],
+    outcome_weighting: str,
+    temperature: float,
+    gamma: float,
+) -> list[float]:
+    if outcome_weighting == "dense":
+        return _dense_decision_weights(decisions, gamma=gamma, temperature=temperature)
+
+    baselines = _seat_baselines(decisions) if outcome_weighting == "advantage" else {}
+    return [
+        _decision_weight(decision, outcome_weighting, baselines=baselines, temperature=temperature)
+        for decision in decisions
+    ]
+
+
+def dense_advantages(decisions: list[dict[str, Any]], gamma: float) -> list[float]:
+    """Signed per-decision advantage from potential-based shaping on the prize diff.
+
+    Phi(s) = opponent_prize_remaining - your_prize_remaining (taking your own prizes
+    lowers your remaining count, raising Phi). The shaped reward gamma*Phi' - Phi
+    telescopes, so it is policy-invariant (no reward hacking); credited as
+    return-to-go with a per-seat baseline that removes the first/second-player effect.
+
+    Returns signed advantages (suitable for policy gradient); the reward-weighted
+    linear trainer exponentiates these into positive weights.
+    """
+    groups: dict[tuple[Any, int], list[int]] = defaultdict(list)
+    for index, decision in enumerate(decisions):
+        key = (decision.get("gameId"), int(decision.get("playerIndex", -1)))
+        groups[key].append(index)
+
+    returns = [0.0] * len(decisions)
+    for indexes in groups.values():
+        indexes.sort(key=lambda index: decisions[index].get("step", 0))
+        rewards: list[float] = []
+        for position, index in enumerate(indexes):
+            phi = _prize_potential(decisions[index])
+            if position + 1 < len(indexes):
+                phi_next = _prize_potential(decisions[indexes[position + 1]])
+            else:
+                outcome = float(decisions[index].get("selectedPlayerOutcome", 0.0))
+                phi_next = outcome * PRIZE_TOTAL
+            rewards.append(gamma * phi_next - phi)
+
+        running = 0.0
+        for position in reversed(range(len(indexes))):
+            running = rewards[position] + gamma * running
+            returns[indexes[position]] = running
+
+    seat_returns: dict[int, list[float]] = defaultdict(list)
+    for index, decision in enumerate(decisions):
+        seat_returns[int(decision.get("playerIndex", -1))].append(returns[index])
+    baselines = {
+        seat: (sum(values) / len(values) if values else 0.0)
+        for seat, values in seat_returns.items()
+    }
+
+    return [
+        returns[index] - baselines.get(int(decision.get("playerIndex", -1)), 0.0)
+        for index, decision in enumerate(decisions)
+    ]
+
+
+def _dense_decision_weights(
+    decisions: list[dict[str, Any]],
+    gamma: float,
+    temperature: float,
+) -> list[float]:
+    """Exponentiated dense advantages, used as positive weights for the linear RWR trainer."""
+    scale = temperature if temperature > 1e-6 else 1e-6
+    return [
+        float(np.exp(np.clip(advantage / scale, -3.0, 3.0)))
+        for advantage in dense_advantages(decisions, gamma=gamma)
+    ]
+
+
+def _prize_potential(decision: dict[str, Any]) -> float:
+    your_remaining = float(decision.get("yourPrizeRemaining", PRIZE_TOTAL))
+    opponent_remaining = float(decision.get("opponentPrizeRemaining", PRIZE_TOTAL))
+    return opponent_remaining - your_remaining
+
+
+def _seat_baselines(decisions: list[dict[str, Any]]) -> dict[int, float]:
+    """Mean outcome per seat (playerIndex), used to remove first/second-player bias."""
+    sums: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    for decision in decisions:
+        player_index = int(decision.get("playerIndex", -1))
+        outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        sums[player_index] = sums.get(player_index, 0.0) + outcome
+        counts[player_index] = counts.get(player_index, 0) + 1
+    return {index: sums[index] / counts[index] for index in sums if counts[index] > 0}
+
+
+def _decision_weight(
+    decision: dict[str, Any],
+    outcome_weighting: str,
+    baselines: dict[int, float],
+    temperature: float,
+) -> float:
     if outcome_weighting == "imitation":
         return 1.0
-    if outcome_weighting != "winner":
-        raise ValueError(f"unknown outcome weighting: {outcome_weighting}")
 
-    selected_player_outcome = float(decision.get("selectedPlayerOutcome", 0.0))
-    if selected_player_outcome > 0:
-        return 1.0
-    if selected_player_outcome == 0:
-        return 0.6
-    return 0.35
+    if outcome_weighting == "winner":
+        selected_player_outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        if selected_player_outcome > 0:
+            return 1.0
+        if selected_player_outcome == 0:
+            return 0.6
+        return 0.35
+
+    if outcome_weighting == "advantage":
+        # Reward-weighted regression with a seat-conditioned baseline so the
+        # dominant first/second-player effect does not drown out action quality.
+        player_index = int(decision.get("playerIndex", -1))
+        outcome = float(decision.get("selectedPlayerOutcome", 0.0))
+        advantage = outcome - baselines.get(player_index, 0.0)
+        scale = temperature if temperature > 1e-6 else 1e-6
+        return float(np.exp(np.clip(advantage / scale, -3.0, 3.0)))
+
+    raise ValueError(f"unknown outcome weighting: {outcome_weighting}")
 
 
 def _loss_and_accuracy(

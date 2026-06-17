@@ -62,3 +62,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Downloaded competition sample agents (re-pull with scripts/benchmark.py opponents)
+benchmarks/**/*.ipynb
+# Temp deck.csv written when loading opponent agents
+/deck.csv

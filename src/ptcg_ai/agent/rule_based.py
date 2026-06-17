@@ -10,19 +10,25 @@ from ptcg_ai.agent.scoring import (
     card_priority,
     discard_priority,
 )
-from ptcg_ai.game.card_db import attack_by_id
+from functools import lru_cache
+
+from ptcg_ai.game.card_db import all_card_data, attack_by_id, card_by_id
 from ptcg_ai.game.constants import (
     BASIC_GRASS_ENERGY,
     BASIC_WATER_ENERGY,
+    BOSS_ORDERS,
+    BUDDY_BUDDY_POFFIN,
     CRUSTLE,
     DWEBBLE,
     KYOGRE,
     LILLIES_DETERMINATION,
     MEGA_ABOMASNOW_EX,
     SNOVER,
+    ULTRA_BALL,
 )
 from ptcg_ai.game.features import (
     active_pokemon,
+    attached_energy_count,
     bench_pokemon,
     count_card_id,
     deck_count,
@@ -30,6 +36,44 @@ from ptcg_ai.game.features import (
     remaining_hp_ratio,
     your_player,
 )
+
+
+@lru_cache(maxsize=None)
+def _evolution_attack_cost(card_name: str) -> int:
+    """Highest attack energy cost among Pokémon that evolve from this card."""
+    best = 0
+    for card in all_card_data():
+        if getattr(card, "evolvesFrom", None) != card_name:
+            continue
+        for attack_id in getattr(card, "attacks", []) or []:
+            attack = attack_by_id(attack_id)
+            if attack is not None:
+                best = max(best, len(getattr(attack, "energies", []) or []))
+    return best
+
+
+@lru_cache(maxsize=None)
+def attack_energy_cost(card_id: int | None) -> int:
+    """Energy a Pokémon needs to attack, read from card data.
+
+    Uses the most expensive attack of the card and of anything it evolves into,
+    so energy is banked on a pre-evolution (e.g. Dwebble) up to what the evolved
+    attacker (Crustle's Superb Scissors = 3) will need.
+    """
+    if card_id is None:
+        return 0
+    card = card_by_id(card_id)
+    if card is None:
+        return 0
+    best = 0
+    for attack_id in getattr(card, "attacks", []) or []:
+        attack = attack_by_id(attack_id)
+        if attack is not None:
+            best = max(best, len(getattr(attack, "energies", []) or []))
+    name = getattr(card, "name", None)
+    if name:
+        best = max(best, _evolution_attack_cost(name))
+    return best
 
 
 def _enum_value(value: object) -> int | None:
@@ -216,6 +260,14 @@ class RuleBasedPolicy(Policy):
             score -= 800.0
         if card_id == MEGA_ABOMASNOW_EX and self._opponent_has_active(obs, CRUSTLE):
             score -= 450.0
+
+        # Keep a bench so a knocked-out active doesn't end the game, and develop
+        # it early with search items.
+        bench = self._your_bench_count(obs)
+        if card_id == DWEBBLE and bench < 3:
+            score += 240.0
+        if card_id in {BUDDY_BUDDY_POFFIN, ULTRA_BALL} and bench < 2:
+            score += 280.0
         return score
 
     def _score_attach(self, obs: object, option: object) -> float:
@@ -236,8 +288,21 @@ class RuleBasedPolicy(Policy):
             score += 160.0
         if source_id == BASIC_GRASS_ENERGY:
             score += 150.0
+        target = self._pokemon_from_area(
+            obs,
+            getattr(option, "inPlayArea", None),
+            getattr(option, "inPlayIndex", None),
+            getattr(option, "playerIndex", None),
+        )
+        needed = attack_energy_cost(target_id)
+        if needed > 0 and attached_energy_count(target) >= needed:
+            # Already has enough energy to attack; more is wasted.
+            return -200.0
         if target_id in {DWEBBLE, CRUSTLE}:
+            # Prioritise powering the Crustle line, and the active attacker first.
             score += 220.0
+            if _is(getattr(option, "inPlayArea", None), AreaType.ACTIVE):
+                score += 60.0
         if self._opponent_has_active(obs, CRUSTLE):
             if target_id == KYOGRE:
                 score += 320.0
@@ -377,6 +442,41 @@ class RuleBasedPolicy(Policy):
             getattr(pokemon, "id", None) == card_id
             for pokemon in bench_pokemon(your_player(obs))
         )
+
+    def _your_bench_count(self, obs: object) -> int:
+        return len(bench_pokemon(your_player(obs)))
+
+    def _pokemon_from_area(
+        self,
+        obs: object,
+        area: object,
+        index: int | None,
+        player_index: int | None,
+    ) -> object | None:
+        if index is None:
+            return None
+        current = getattr(obs, "current", None)
+        if current is None:
+            return None
+        if player_index is None:
+            player_index = getattr(current, "yourIndex")
+        players = getattr(current, "players")
+        if player_index >= len(players):
+            return None
+        player = players[player_index]
+        if _is(area, AreaType.ACTIVE):
+            return self._object_at(getattr(player, "active", None), index)
+        if _is(area, AreaType.BENCH):
+            return self._object_at(getattr(player, "bench", None), index)
+        return None
+
+    def _object_at(self, cards: Iterable[object] | None, index: int) -> object | None:
+        if cards is None:
+            return None
+        cards_list = list(cards)
+        if index >= len(cards_list):
+            return None
+        return cards_list[index]
 
     def _option_card_id(self, obs: object, option: object) -> int | None:
         explicit_id = getattr(option, "cardId", None)
