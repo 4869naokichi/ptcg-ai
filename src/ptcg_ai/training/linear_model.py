@@ -168,17 +168,16 @@ def _compute_decision_weights(
     ]
 
 
-def _dense_decision_weights(
-    decisions: list[dict[str, Any]],
-    gamma: float,
-    temperature: float,
-) -> list[float]:
-    """Potential-based shaping on the prize differential, credited as return-to-go.
+def dense_advantages(decisions: list[dict[str, Any]], gamma: float) -> list[float]:
+    """Signed per-decision advantage from potential-based shaping on the prize diff.
 
     Phi(s) = opponent_prize_remaining - your_prize_remaining (taking your own prizes
     lowers your remaining count, raising Phi). The shaped reward gamma*Phi' - Phi
-    telescopes, so it is policy-invariant (no reward hacking); a per-seat baseline
-    removes the residual first/second-player effect.
+    telescopes, so it is policy-invariant (no reward hacking); credited as
+    return-to-go with a per-seat baseline that removes the first/second-player effect.
+
+    Returns signed advantages (suitable for policy gradient); the reward-weighted
+    linear trainer exponentiates these into positive weights.
     """
     groups: dict[tuple[Any, int], list[int]] = defaultdict(list)
     for index, decision in enumerate(decisions):
@@ -211,13 +210,23 @@ def _dense_decision_weights(
         for seat, values in seat_returns.items()
     }
 
+    return [
+        returns[index] - baselines.get(int(decision.get("playerIndex", -1)), 0.0)
+        for index, decision in enumerate(decisions)
+    ]
+
+
+def _dense_decision_weights(
+    decisions: list[dict[str, Any]],
+    gamma: float,
+    temperature: float,
+) -> list[float]:
+    """Exponentiated dense advantages, used as positive weights for the linear RWR trainer."""
     scale = temperature if temperature > 1e-6 else 1e-6
-    weights: list[float] = []
-    for index, decision in enumerate(decisions):
-        seat = int(decision.get("playerIndex", -1))
-        advantage = returns[index] - baselines.get(seat, 0.0)
-        weights.append(float(np.exp(np.clip(advantage / scale, -3.0, 3.0))))
-    return weights
+    return [
+        float(np.exp(np.clip(advantage / scale, -3.0, 3.0)))
+        for advantage in dense_advantages(decisions, gamma=gamma)
+    ]
 
 
 def _prize_potential(decision: dict[str, Any]) -> float:

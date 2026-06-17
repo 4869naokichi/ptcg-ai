@@ -10,6 +10,7 @@ from ptcg_ai.agent.policy import Policy
 from ptcg_ai.agent.rule_based import RuleBasedPolicy
 from ptcg_ai.training.features import option_features
 from ptcg_ai.training.linear_model import LinearActionModel
+from ptcg_ai.training.mlp_model import MLPActionModel
 
 
 class LearnedPolicy:
@@ -108,6 +109,30 @@ class StochasticLearnedPolicy(LearnedPolicy):
             p=probabilities,
         )
         return sorted(int(index) for index in chosen)
+
+
+class MLPPolicy(LearnedPolicy):
+    """Greedy policy backed by the numpy MLP action model (inference only)."""
+
+    def __init__(self, model_path: Path, fallback: Policy | None = None) -> None:
+        self.model = MLPActionModel.load(model_path)
+        self.fallback = fallback or RuleBasedPolicy()
+
+
+class StochasticMLPPolicy(StochasticLearnedPolicy):
+    """Softmax-sampling MLP policy for exploration during self-play collection."""
+
+    def __init__(
+        self,
+        model_path: Path,
+        fallback: Policy | None = None,
+        temperature: float = 1.0,
+        seed: int | None = None,
+    ) -> None:
+        self.model = MLPActionModel.load(model_path)
+        self.fallback = fallback or RuleBasedPolicy()
+        self.temperature = temperature
+        self.rng = np.random.default_rng(seed)
 
 
 def _softmax(values: np.ndarray) -> np.ndarray:

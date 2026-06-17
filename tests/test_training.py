@@ -197,6 +197,56 @@ class TrainingTest(unittest.TestCase):
             self.assertEqual(model.metadata["outcomeWeighting"], "dense")
             self.assertEqual(model.metadata["gamma"], 0.95)
 
+    def test_policy_gradient_prefers_advantaged_action(self) -> None:
+        from ptcg_ai.training.mlp_model import (
+            MLPActionModel,
+            train_policy_gradient_from_jsonl,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = Path(tmp_dir) / "self_play.jsonl"
+            output_path = Path(tmp_dir) / "mlp.npz"
+            lines = []
+            # Positive-advantage game: the crustle option is chosen and prizes are taken.
+            for step, your_remaining in ((0, 6), (2, 4)):
+                lines.append(json.dumps({
+                    "recordType": "decision", "gameId": 0, "playerIndex": 0, "step": step,
+                    "yourPrizeRemaining": your_remaining, "opponentPrizeRemaining": 6,
+                    "selectedPlayerOutcome": 1.0,
+                    "options": [
+                        {"selected": True, "features": {"card_crustle": 1.0}},
+                        {"selected": False, "features": {"card_kyogre": 1.0}},
+                    ],
+                }))
+            # Negative-advantage game: prizes are given up.
+            for step, opp_remaining in ((0, 6), (2, 4)):
+                lines.append(json.dumps({
+                    "recordType": "decision", "gameId": 1, "playerIndex": 0, "step": step,
+                    "yourPrizeRemaining": 6, "opponentPrizeRemaining": opp_remaining,
+                    "selectedPlayerOutcome": -1.0,
+                    "options": [
+                        {"selected": True, "features": {"card_kyogre": 1.0}},
+                        {"selected": False, "features": {"card_crustle": 1.0}},
+                    ],
+                }))
+            input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+            stats = train_policy_gradient_from_jsonl(
+                input_path=input_path,
+                output_path=output_path,
+                hidden=8,
+                epochs=200,
+                learning_rate=0.05,
+            )
+            model = MLPActionModel.load(output_path)
+
+            self.assertEqual(stats.samples, 4)
+            # The crustle action came from the winning (positive-advantage) games.
+            self.assertGreater(
+                model.score({"card_crustle": 1.0}),
+                model.score({"card_kyogre": 1.0}),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

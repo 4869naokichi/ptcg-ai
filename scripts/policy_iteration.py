@@ -10,7 +10,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "submission"))
 sys.path.insert(0, str(ROOT / "src"))
 
-from ptcg_ai.agent.learned_policy import LearnedPolicy, StochasticLearnedPolicy
+from ptcg_ai.agent.learned_policy import (
+    LearnedPolicy,
+    MLPPolicy,
+    StochasticLearnedPolicy,
+    StochasticMLPPolicy,
+)
 from ptcg_ai.agent.policy import Policy
 from ptcg_ai.agent.random_policy import RandomPolicy
 from ptcg_ai.agent.rule_based import RuleBasedPolicy
@@ -18,6 +23,7 @@ from ptcg_ai.decks import ABOMASNOW_DECK, CRUSTLE_DECK, DEFAULT_DECK
 from ptcg_ai.evaluation.self_play import evaluate_self_play
 from ptcg_ai.training.linear_model import train_from_jsonl
 from ptcg_ai.training.logs import append_jsonl_many
+from ptcg_ai.training.mlp_model import train_policy_gradient_from_jsonl
 from ptcg_ai.training.self_play import collect_logged_game
 
 
@@ -31,28 +37,69 @@ def build_deck(name: str) -> list[int]:
     raise ValueError(f"unknown deck: {name}")
 
 
-def build_eval_policy(best_model: Path) -> Policy:
+def build_eval_policy(best_model: Path, policy_kind: str) -> Policy:
     """Greedy policy used for head-to-head gating: argmax over the learned scores."""
-    if best_model.exists():
-        return LearnedPolicy(model_path=best_model, fallback=RuleBasedPolicy())
-    return RuleBasedPolicy()
+    if not best_model.exists():
+        return RuleBasedPolicy()
+    if policy_kind == "mlp":
+        return MLPPolicy(model_path=best_model, fallback=RuleBasedPolicy())
+    return LearnedPolicy(model_path=best_model, fallback=RuleBasedPolicy())
 
 
-def build_explore_policy(best_model: Path, temperature: float, seed: int) -> Policy:
+def build_explore_policy(best_model: Path, policy_kind: str, temperature: float, seed: int) -> Policy:
     """Stochastic policy used to collect self-play data with exploration.
 
     Deterministic self-play in a mirror never benches, so prizes never move and a
     dense (prize-based) reward stays invisible. Sampling injects that variety; with
     no model yet we fall back to random play, which already develops the board.
     """
-    if best_model.exists():
-        return StochasticLearnedPolicy(
+    if not best_model.exists():
+        return RandomPolicy(seed=seed)
+    if policy_kind == "mlp":
+        return StochasticMLPPolicy(
             model_path=best_model,
             fallback=RuleBasedPolicy(),
             temperature=temperature,
             seed=seed,
         )
-    return RandomPolicy(seed=seed)
+    return StochasticLearnedPolicy(
+        model_path=best_model,
+        fallback=RuleBasedPolicy(),
+        temperature=temperature,
+        seed=seed,
+    )
+
+
+def train_candidate(
+    policy_kind: str,
+    log_path: Path,
+    output_path: Path,
+    args: argparse.Namespace,
+) -> str:
+    """Train one candidate model and return a one-line summary."""
+    if policy_kind == "mlp":
+        stats = train_policy_gradient_from_jsonl(
+            input_path=log_path,
+            output_path=output_path,
+            hidden=args.hidden,
+            epochs=args.epochs,
+            learning_rate=args.learning_rate,
+            gamma=args.gamma,
+            seed=args.seed,
+        )
+        return f"trained samples={stats.samples} loss={stats.loss:.6f}"
+
+    stats = train_from_jsonl(
+        input_path=log_path,
+        output_path=output_path,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        l2=args.l2,
+        outcome_weighting=args.outcome_weighting,
+        temperature=args.temperature,
+        gamma=args.gamma,
+    )
+    return f"trained pairs={stats.pairs} loss={stats.loss:.6f} pairwise_accuracy={stats.accuracy:.3f}"
 
 
 def collect_round(
@@ -120,6 +167,13 @@ def main() -> None:
     parser.add_argument("--eval-games", type=int, default=200, help="head-to-head games for gating")
     parser.add_argument("--max-steps", type=int, default=1_000)
     parser.add_argument("--deck", choices=["default", "crustle", "abomasnow"], default="default")
+    parser.add_argument(
+        "--policy",
+        choices=["linear", "mlp"],
+        default="linear",
+        help="linear = reward-weighted ranking; mlp = REINFORCE policy gradient",
+    )
+    parser.add_argument("--hidden", type=int, default=32, help="MLP hidden width")
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--learning-rate", type=float, default=0.08)
     parser.add_argument("--l2", type=float, default=0.001)
@@ -156,15 +210,21 @@ def main() -> None:
     args.workdir.mkdir(parents=True, exist_ok=True)
     args.best_model.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.init_model is not None and args.init_model.exists() and not args.best_model.exists():
+    # The seed model only matches the linear format; the MLP loop bootstraps from random.
+    if (
+        args.policy == "linear"
+        and args.init_model is not None
+        and args.init_model.exists()
+        and not args.best_model.exists()
+    ):
         shutil.copyfile(args.init_model, args.best_model)
         print(f"seeded best model from {args.init_model}")
 
     for round_index in range(args.rounds):
         print(f"=== round {round_index} ===")
         seed = args.seed + round_index * 1000
-        explore0 = build_explore_policy(args.best_model, args.explore_temp, seed=seed)
-        explore1 = build_explore_policy(args.best_model, args.explore_temp, seed=seed + 1)
+        explore0 = build_explore_policy(args.best_model, args.policy, args.explore_temp, seed=seed)
+        explore1 = build_explore_policy(args.best_model, args.policy, args.explore_temp, seed=seed + 1)
         log_path = args.workdir / f"round_{round_index}.jsonl"
         decisions, collect_errors, prize_games = collect_round(
             deck=deck,
@@ -180,20 +240,11 @@ def main() -> None:
         )
 
         candidate_model = args.workdir / f"round_{round_index}.npz"
-        stats = train_from_jsonl(
-            input_path=log_path,
-            output_path=candidate_model,
-            epochs=args.epochs,
-            learning_rate=args.learning_rate,
-            l2=args.l2,
-            outcome_weighting=args.outcome_weighting,
-            temperature=args.temperature,
-            gamma=args.gamma,
-        )
-        print(f"trained pairs={stats.pairs} loss={stats.loss:.6f} pairwise_accuracy={stats.accuracy:.3f}")
+        summary = train_candidate(args.policy, log_path, candidate_model, args)
+        print(summary)
 
-        candidate_policy = LearnedPolicy(model_path=candidate_model, fallback=RuleBasedPolicy())
-        best_policy = build_eval_policy(args.best_model)
+        candidate_policy = build_eval_policy(candidate_model, args.policy)
+        best_policy = build_eval_policy(args.best_model, args.policy)
         win_rate, candidate_wins, opponent_wins, decided = head_to_head(
             deck=deck,
             candidate=candidate_policy,
