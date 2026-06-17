@@ -29,10 +29,11 @@ def main() -> None:
     parser.add_argument("--l2", type=float, default=0.001)
     parser.add_argument(
         "--outcome-weighting",
-        choices=["imitation", "winner", "advantage"],
+        choices=["imitation", "winner", "advantage", "dense"],
         default="imitation",
     )
     parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=0.99)
     args = parser.parse_args()
 
     stats = train_from_jsonl(
@@ -43,6 +44,7 @@ def main() -> None:
         l2=args.l2,
         outcome_weighting=args.outcome_weighting,
         temperature=args.temperature,
+        gamma=args.gamma,
     )
     print(f"wrote {stats.output_path}")
     print(f"decisions={stats.decisions}")

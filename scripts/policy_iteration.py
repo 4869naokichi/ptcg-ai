@@ -10,8 +10,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "submission"))
 sys.path.insert(0, str(ROOT / "src"))
 
-from ptcg_ai.agent.learned_policy import LearnedPolicy
+from ptcg_ai.agent.learned_policy import LearnedPolicy, StochasticLearnedPolicy
 from ptcg_ai.agent.policy import Policy
+from ptcg_ai.agent.random_policy import RandomPolicy
 from ptcg_ai.agent.rule_based import RuleBasedPolicy
 from ptcg_ai.decks import ABOMASNOW_DECK, CRUSTLE_DECK, DEFAULT_DECK
 from ptcg_ai.evaluation.self_play import evaluate_self_play
@@ -30,42 +31,67 @@ def build_deck(name: str) -> list[int]:
     raise ValueError(f"unknown deck: {name}")
 
 
-def build_best_policy(best_model: Path) -> Policy:
-    """The current best policy: learned if a model exists, else rule-based bootstrap."""
+def build_eval_policy(best_model: Path) -> Policy:
+    """Greedy policy used for head-to-head gating: argmax over the learned scores."""
     if best_model.exists():
         return LearnedPolicy(model_path=best_model, fallback=RuleBasedPolicy())
     return RuleBasedPolicy()
 
 
+def build_explore_policy(best_model: Path, temperature: float, seed: int) -> Policy:
+    """Stochastic policy used to collect self-play data with exploration.
+
+    Deterministic self-play in a mirror never benches, so prizes never move and a
+    dense (prize-based) reward stays invisible. Sampling injects that variety; with
+    no model yet we fall back to random play, which already develops the board.
+    """
+    if best_model.exists():
+        return StochasticLearnedPolicy(
+            model_path=best_model,
+            fallback=RuleBasedPolicy(),
+            temperature=temperature,
+            seed=seed,
+        )
+    return RandomPolicy(seed=seed)
+
+
 def collect_round(
     deck: list[int],
-    policy: Policy,
+    policy0: Policy,
+    policy1: Policy,
     games: int,
     log_path: Path,
     max_steps: int,
-) -> tuple[int, int]:
-    """Self-play the current policy against itself and log every decision."""
+) -> tuple[int, int, int]:
+    """Self-play (with exploration) and log every decision, tracking prize movement."""
     if log_path.exists():
         log_path.unlink()
 
     decisions = 0
     errors = 0
+    prize_games = 0
     for game_id in range(games):
         result = collect_logged_game(
             deck0=deck,
             deck1=deck,
-            policy0=policy,
-            policy1=policy,
+            policy0=policy0,
+            policy1=policy1,
             game_id=game_id,
             max_steps=max_steps,
-            policy0_name="best",
-            policy1_name="best",
+            policy0_name="explore",
+            policy1_name="explore",
         )
         append_jsonl_many(log_path, result.records)
-        decisions += len([r for r in result.records if r.get("recordType") == "decision"])
+        game_decisions = [r for r in result.records if r.get("recordType") == "decision"]
+        decisions += len(game_decisions)
+        if any(
+            int(r.get("yourPrizeRemaining", 6)) < 6 or int(r.get("opponentPrizeRemaining", 6)) < 6
+            for r in game_decisions
+        ):
+            prize_games += 1
         if result.error:
             errors += 1
-    return decisions, errors
+    return decisions, errors, prize_games
 
 
 def head_to_head(
@@ -97,7 +123,20 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--learning-rate", type=float, default=0.08)
     parser.add_argument("--l2", type=float, default=0.001)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument(
+        "--outcome-weighting",
+        choices=["winner", "advantage", "dense"],
+        default="dense",
+    )
+    parser.add_argument("--temperature", type=float, default=1.0, help="training advantage temperature")
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument(
+        "--explore-temp",
+        type=float,
+        default=0.5,
+        help="softmax temperature for self-play exploration",
+    )
+    parser.add_argument("--seed", type=int, default=4869)
     parser.add_argument("--margin", type=float, default=0.02, help="win-rate margin required to promote")
     parser.add_argument(
         "--init-model",
@@ -123,16 +162,22 @@ def main() -> None:
 
     for round_index in range(args.rounds):
         print(f"=== round {round_index} ===")
-        best_policy = build_best_policy(args.best_model)
+        seed = args.seed + round_index * 1000
+        explore0 = build_explore_policy(args.best_model, args.explore_temp, seed=seed)
+        explore1 = build_explore_policy(args.best_model, args.explore_temp, seed=seed + 1)
         log_path = args.workdir / f"round_{round_index}.jsonl"
-        decisions, collect_errors = collect_round(
+        decisions, collect_errors, prize_games = collect_round(
             deck=deck,
-            policy=best_policy,
+            policy0=explore0,
+            policy1=explore1,
             games=args.games,
             log_path=log_path,
             max_steps=args.max_steps,
         )
-        print(f"collected games={args.games} decisions={decisions} errors={collect_errors}")
+        print(
+            f"collected games={args.games} decisions={decisions} "
+            f"errors={collect_errors} games_with_prize_taken={prize_games}"
+        )
 
         candidate_model = args.workdir / f"round_{round_index}.npz"
         stats = train_from_jsonl(
@@ -141,12 +186,14 @@ def main() -> None:
             epochs=args.epochs,
             learning_rate=args.learning_rate,
             l2=args.l2,
-            outcome_weighting="advantage",
+            outcome_weighting=args.outcome_weighting,
             temperature=args.temperature,
+            gamma=args.gamma,
         )
         print(f"trained pairs={stats.pairs} loss={stats.loss:.6f} pairwise_accuracy={stats.accuracy:.3f}")
 
         candidate_policy = LearnedPolicy(model_path=candidate_model, fallback=RuleBasedPolicy())
+        best_policy = build_eval_policy(args.best_model)
         win_rate, candidate_wins, opponent_wins, decided = head_to_head(
             deck=deck,
             candidate=candidate_policy,

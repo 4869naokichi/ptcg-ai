@@ -17,6 +17,7 @@ from ptcg_ai.training.features import FEATURE_NAMES, option_features, vectorize
 from ptcg_ai.training.linear_model import (
     LinearActionModel,
     _decision_weight,
+    _dense_decision_weights,
     _seat_baselines,
     train_from_jsonl,
 )
@@ -143,6 +144,58 @@ class TrainingTest(unittest.TestCase):
             self.assertEqual(stats.pairs, 1)
             self.assertEqual(model.metadata["outcomeWeighting"], "advantage")
             self.assertEqual(model.metadata["temperature"], 0.5)
+
+    def test_dense_weights_reward_prize_progress(self) -> None:
+        # Same seat, two games: one where player0 takes prizes and wins, one where
+        # player0 gives up prizes and loses. The winning trajectory must weigh more.
+        decisions = [
+            {"gameId": 0, "playerIndex": 0, "step": 0,
+             "yourPrizeRemaining": 6, "opponentPrizeRemaining": 6, "selectedPlayerOutcome": 1.0},
+            {"gameId": 0, "playerIndex": 0, "step": 2,
+             "yourPrizeRemaining": 4, "opponentPrizeRemaining": 6, "selectedPlayerOutcome": 1.0},
+            {"gameId": 1, "playerIndex": 0, "step": 0,
+             "yourPrizeRemaining": 6, "opponentPrizeRemaining": 6, "selectedPlayerOutcome": -1.0},
+            {"gameId": 1, "playerIndex": 0, "step": 2,
+             "yourPrizeRemaining": 6, "opponentPrizeRemaining": 4, "selectedPlayerOutcome": -1.0},
+        ]
+        weights = _dense_decision_weights(decisions, gamma=0.99, temperature=2.0)
+        winning = (weights[0] + weights[1]) / 2
+        losing = (weights[2] + weights[3]) / 2
+        self.assertGreater(winning, losing)
+
+    def test_train_from_jsonl_accepts_dense_weighting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = Path(tmp_dir) / "self_play.jsonl"
+            output_path = Path(tmp_dir) / "model.npz"
+            decision = {
+                "recordType": "decision",
+                "gameId": 0,
+                "playerIndex": 0,
+                "step": 0,
+                "yourPrizeRemaining": 4,
+                "opponentPrizeRemaining": 6,
+                "selectedPlayerOutcome": 1.0,
+                "options": [
+                    {"selected": True, "features": {"card_crustle": 1.0}},
+                    {"selected": False, "features": {"card_kyogre": 1.0}},
+                ],
+            }
+            input_path.write_text(json.dumps(decision) + "\n", encoding="utf-8")
+
+            stats = train_from_jsonl(
+                input_path=input_path,
+                output_path=output_path,
+                epochs=20,
+                learning_rate=0.2,
+                l2=0.0,
+                outcome_weighting="dense",
+                gamma=0.95,
+            )
+            model = LinearActionModel.load(output_path)
+
+            self.assertEqual(stats.pairs, 1)
+            self.assertEqual(model.metadata["outcomeWeighting"], "dense")
+            self.assertEqual(model.metadata["gamma"], 0.95)
 
 
 if __name__ == "__main__":

@@ -138,6 +138,10 @@ def _decision_record(
     selected_set = set(selected)
     player_index = int(getattr(current, "yourIndex"))
 
+    players = getattr(current, "players")
+    your_prize_remaining = _prize_remaining(players[player_index])
+    opponent_prize_remaining = _prize_remaining(players[1 - player_index])
+
     options = []
     for index, option in enumerate(getattr(select, "option")):
         score = _policy_score(policy, obs, option)
@@ -164,6 +168,8 @@ def _decision_record(
         "turn": int(getattr(current, "turn")),
         "turnActionCount": int(getattr(current, "turnActionCount")),
         "playerIndex": player_index,
+        "yourPrizeRemaining": your_prize_remaining,
+        "opponentPrizeRemaining": opponent_prize_remaining,
         "policy": policy_name,
         "selected": selected,
         "selectType": _enum_name(getattr(select, "type", None)),
@@ -174,6 +180,10 @@ def _decision_record(
         "maxCount": int(getattr(select, "maxCount")),
         "options": options,
     }
+
+
+def _prize_remaining(player: object) -> int:
+    return len(getattr(player, "prize", []) or [])
 
 
 def _policy_score(policy: Policy, obs: object, option: object) -> float | None:
